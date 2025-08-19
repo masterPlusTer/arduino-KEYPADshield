@@ -1,6 +1,7 @@
 #include <avr/io.h>
 #include <util/delay.h>
-#include <stdio.h>
+#include <avr/interrupt.h>
+#include <stdint.h>
 
 // ==================== Pines del LCD ====================
 #define LCD_RS PB0
@@ -11,20 +12,13 @@
 #define LCD_D7 PD7
 #define LCD_BL PB2
 
-// Pin del teclado
-#define BUTTON_PIN 0  // ADC0
+#define BUTTON_PIN 0 // ADC0
 
-// ==================== Botones ====================
-enum LCDButton {
-    ButtonNone = 0,
-    ButtonRight = 1,
-    ButtonUp = 2,
-    ButtonDown = 3,
-    ButtonLeft = 4,
-    ButtonSelect = 5
-};
+typedef enum {
+    ButtonNone=0, ButtonRight, ButtonUp, ButtonDown, ButtonLeft, ButtonSelect
+} LCDButton;
 
-// ==================== Funciones LCD ====================
+// ==================== LCD ====================
 void lcdPulseEnable() {
     PORTB &= ~(1<<LCD_EN);
     _delay_us(1);
@@ -35,122 +29,138 @@ void lcdPulseEnable() {
 }
 
 void lcdWrite4bits(uint8_t nibble, uint8_t isData) {
-    if(isData) PORTB |= (1<<LCD_RS);
-    else PORTB &= ~(1<<LCD_RS);
-
-    if(nibble & 0x01) PORTD |= (1<<LCD_D4); else PORTD &= ~(1<<LCD_D4);
-    if(nibble & 0x02) PORTD |= (1<<LCD_D5); else PORTD &= ~(1<<LCD_D5);
-    if(nibble & 0x04) PORTD |= (1<<LCD_D6); else PORTD &= ~(1<<LCD_D6);
-    if(nibble & 0x08) PORTD |= (1<<LCD_D7); else PORTD &= ~(1<<LCD_D7);
-
+    if(isData) PORTB |= (1<<LCD_RS); else PORTB &= ~(1<<LCD_RS);
+    PORTD = (PORTD & 0x0F) | ((nibble & 0x0F)<<4);
     lcdPulseEnable();
 }
 
-// Pequeña espera mínima para inicialización
-void shortWait() {
-    for(volatile uint16_t i=0; i<3000; i++);
-}
-
 void lcdCommand(uint8_t cmd) {
-    lcdWrite4bits(cmd >> 4, 0);
-    lcdWrite4bits(cmd & 0x0F, 0);
+    lcdWrite4bits(cmd>>4,0);
+    lcdWrite4bits(cmd & 0x0F,0);
     _delay_ms(2);
 }
 
 void lcdData(uint8_t data) {
-    lcdWrite4bits(data >> 4, 1);
-    lcdWrite4bits(data & 0x0F, 1);
+    lcdWrite4bits(data>>4,1);
+    lcdWrite4bits(data & 0x0F,1);
     _delay_ms(2);
 }
 
 void lcdInit() {
     DDRB |= (1<<LCD_RS)|(1<<LCD_EN)|(1<<LCD_BL);
     DDRD |= (1<<LCD_D4)|(1<<LCD_D5)|(1<<LCD_D6)|(1<<LCD_D7);
+    PORTB |= (1<<LCD_BL);
 
-    PORTB |= (1<<LCD_BL); // Backlight ON
     _delay_ms(50);
+    lcdWrite4bits(0x03,0);
+    _delay_ms(5);
+    lcdWrite4bits(0x03,0);
+    _delay_us(150);
+    lcdWrite4bits(0x03,0);
+    lcdWrite4bits(0x02,0);
 
-    // Secuencia de inicialización segura
-    lcdWrite4bits(0x03, 0); shortWait();
-    lcdWrite4bits(0x03, 0); shortWait();
-    lcdWrite4bits(0x03, 0); shortWait();
-    lcdWrite4bits(0x02, 0); // 4-bit mode
-    shortWait();
-
-    lcdCommand(0x28); // 4-bit, 2 líneas, 5x8
-    lcdCommand(0x0C); // Display ON, cursor OFF
-    lcdCommand(0x06); // Incrementar cursor
-    lcdCommand(0x01); // Clear display
+    lcdCommand(0x28);
+    lcdCommand(0x0C);
+    lcdCommand(0x06);
+    lcdCommand(0x01);
     _delay_ms(2);
 }
 
-void lcdSetCursor(uint8_t col, uint8_t row) {
-    uint8_t row_offsets[] = {0x00, 0x40};
-    lcdCommand(0x80 | (col + row_offsets[row]));
+void lcdSetCursor(uint8_t col,uint8_t row){
+    uint8_t row_offsets[]={0x00,0x40};
+    lcdCommand(0x80|(col+row_offsets[row]));
 }
 
-void lcdPrint(const char* str) {
+void lcdPrint(const char* str){
     while(*str) lcdData(*str++);
 }
 
-void lcdBacklightOn() { PORTB |= (1<<LCD_BL); }
-void lcdBacklightOff() { PORTB &= ~(1<<LCD_BL); }
+void lcdBacklightOn(){ PORTB |= (1<<LCD_BL); }
+void lcdBacklightOff(){ PORTB &= ~(1<<LCD_BL); }
 
-// ==================== Función de botones ====================
-LCDButton getButtons() {
-    static LCDButton keyLast = ButtonNone;
-    static unsigned long keyTimeLast = 0;
+// ==================== Timer / millis ====================
+volatile uint32_t sysMillis=0;
+ISR(TIMER0_COMPA_vect){ sysMillis++; }
+uint32_t millis(){ return sysMillis; }
 
-    int analogKey;
+void timer0_init(){
+    TCCR0A = (1<<WGM01);
+    TCCR0B = (1<<CS01)|(1<<CS00);
+    OCR0A = 249;
+    TIMSK0 = (1<<OCIE0A);
+    sei();
+}
 
-    // Leer ADC0
-    ADMUX = (1<<REFS0) | (BUTTON_PIN & 0x07);
+// ==================== ADC ====================
+void adcInit(){ ADCSRA = (1<<ADEN)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0); }
+
+uint16_t readADC(uint8_t ch){
+    ADMUX = (1<<REFS0) | (ch & 0x07);
     ADCSRA |= (1<<ADSC);
     while(ADCSRA & (1<<ADSC));
-    analogKey = ADC;
+    return ADC;
+}
 
+// ==================== Botones ====================
+LCDButton getButtons(){
+    static LCDButton lastKey = ButtonNone;
+    static uint32_t lastTime = 0;
+    uint32_t now = millis();
+    uint16_t val = readADC(BUTTON_PIN);
     LCDButton key;
-    if ((millis() - keyTimeLast) < 50) return keyLast; // más sensible
-    keyTimeLast = millis();
 
-    if (analogKey < 50) key = ButtonRight;
-    else if (analogKey < 200) key = ButtonUp;
-    else if (analogKey < 300) key = ButtonDown;
-    else if (analogKey < 500) key = ButtonLeft;
-    else if (analogKey < 700) key = ButtonSelect;
+    if(val < 50) key = ButtonRight;
+    else if(val < 200) key = ButtonUp;
+    else if(val < 300) key = ButtonDown;
+    else if(val < 500) key = ButtonLeft;
+    else if(val < 700) key = ButtonSelect;
     else key = ButtonNone;
 
-    if (key == keyLast) return key;
-    keyLast = key;
-    return key;
+    // debounce simple
+    if(key != lastKey){
+        if(now - lastTime > 50){
+            lastTime = now;
+            lastKey = key;
+            return key;
+        }else{
+            return ButtonNone;
+        }
+    }
+    return lastKey;
 }
 
-// ==================== Setup y Loop ====================
-void setup() {
+// ==================== Setup / Loop ====================
+void setup(){
     lcdInit();
     lcdBacklightOn();
-    lcdSetCursor(0, 0);
+    lcdSetCursor(0,0);
     lcdPrint("Push the buttons");
-
-    // Parpadeo del backlight 3 veces
-    for(uint8_t i=0; i<3; i++) {
-        lcdBacklightOff();
-        _delay_ms(500);
-        lcdBacklightOn();
-        _delay_ms(500);
-    }
+    adcInit();
+    timer0_init();
 }
 
-void loop() {
-    // Mostrar segundos desde encendido
-    lcdSetCursor(9, 1);
-    char buffer[6];
-    sprintf(buffer, "%4lu", millis()/1000);
-    lcdPrint(buffer);
+void loop(){
+    static uint32_t lastSec=0;
+    uint32_t now = millis();
 
-    // Leer botón y mostrarlo
-    lcdSetCursor(0, 1);
-    switch(getButtons()) {
+    // contador de segundos
+    if(now - lastSec >= 1000){
+        lastSec = now;
+        lcdSetCursor(9,1);
+        uint32_t sec = now/1000;
+        char buf[5];
+        buf[0]='0'+(sec/1000)%10;
+        buf[1]='0'+(sec/100)%10;
+        buf[2]='0'+(sec/10)%10;
+        buf[3]='0'+(sec%10);
+        buf[4]='\0';
+        lcdPrint(buf);
+    }
+
+    // leer botones
+    LCDButton b = getButtons();
+    lcdSetCursor(0,1);
+    switch(b){
         case ButtonRight: lcdPrint("RIGHT "); break;
         case ButtonLeft:  lcdPrint("LEFT  "); break;
         case ButtonUp:    lcdPrint("UP    "); break;
@@ -159,3 +169,5 @@ void loop() {
         case ButtonNone:  lcdPrint("NONE  "); break;
     }
 }
+
+int main(){ setup(); while(1) loop(); }

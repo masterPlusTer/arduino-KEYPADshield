@@ -1,5 +1,4 @@
 #include <avr/io.h>
-#include <avr/interrupt.h>
 #include <util/delay.h>
 #include <stdio.h>
 
@@ -12,43 +11,18 @@
 #define LCD_D7 PD7
 #define LCD_BL PB2
 
-// Pin del teclado (ADC0)
-#define BUTTON_PIN 0  
+// Pin del teclado
+#define BUTTON_PIN 0  // ADC0
 
 // ==================== Botones ====================
-typedef enum {
+enum LCDButton {
     ButtonNone = 0,
-    ButtonRight,
-    ButtonUp,
-    ButtonDown,
-    ButtonLeft,
-    ButtonSelect
-} LCDButton;
-
-// ==================== Variables globales ====================
-volatile unsigned long millisCounter = 0;
-
-// ==================== Timer0 para millis() ====================
-ISR(TIMER0_COMPA_vect) {
-    millisCounter++;
-}
-
-void timer0Init() {
-    // CTC mode, prescaler 64, OCR0A = 249 → 1 ms
-    TCCR0A = (1<<WGM01);
-    TCCR0B = (1<<CS01)|(1<<CS00);
-    OCR0A = 249;
-    TIMSK0 = (1<<OCIE0A);
-    sei(); // Habilitar interrupciones
-}
-
-unsigned long millis() {
-    unsigned long m;
-    cli();
-    m = millisCounter;
-    sei();
-    return m;
-}
+    ButtonRight = 1,
+    ButtonUp = 2,
+    ButtonDown = 3,
+    ButtonLeft = 4,
+    ButtonSelect = 5
+};
 
 // ==================== Funciones LCD ====================
 void lcdPulseEnable() {
@@ -72,6 +46,11 @@ void lcdWrite4bits(uint8_t nibble, uint8_t isData) {
     lcdPulseEnable();
 }
 
+// Pequeña espera mínima para inicialización
+void shortWait() {
+    for(volatile uint16_t i=0; i<3000; i++);
+}
+
 void lcdCommand(uint8_t cmd) {
     lcdWrite4bits(cmd >> 4, 0);
     lcdWrite4bits(cmd & 0x0F, 0);
@@ -91,12 +70,12 @@ void lcdInit() {
     PORTB |= (1<<LCD_BL); // Backlight ON
     _delay_ms(50);
 
-    lcdWrite4bits(0x03, 0);
-    _delay_ms(5);
-    lcdWrite4bits(0x03, 0);
-    _delay_us(150);
-    lcdWrite4bits(0x03, 0);
+    // Secuencia de inicialización segura
+    lcdWrite4bits(0x03, 0); shortWait();
+    lcdWrite4bits(0x03, 0); shortWait();
+    lcdWrite4bits(0x03, 0); shortWait();
     lcdWrite4bits(0x02, 0); // 4-bit mode
+    shortWait();
 
     lcdCommand(0x28); // 4-bit, 2 líneas, 5x8
     lcdCommand(0x0C); // Display ON, cursor OFF
@@ -131,7 +110,7 @@ LCDButton getButtons() {
     analogKey = ADC;
 
     LCDButton key;
-    if ((millis() - keyTimeLast) < 50) return keyLast; // debounce 50 ms
+    if ((millis() - keyTimeLast) < 50) return keyLast; // más sensible
     keyTimeLast = millis();
 
     if (analogKey < 50) key = ButtonRight;
@@ -141,37 +120,36 @@ LCDButton getButtons() {
     else if (analogKey < 700) key = ButtonSelect;
     else key = ButtonNone;
 
+    if (key == keyLast) return key;
     keyLast = key;
     return key;
 }
 
-// ==================== Setup ====================
+// ==================== Setup y Loop ====================
 void setup() {
     lcdInit();
     lcdBacklightOn();
-    lcdSetCursor(0,0);
+    lcdSetCursor(0, 0);
     lcdPrint("Push the buttons");
 
-    timer0Init();
-
     // Parpadeo del backlight 3 veces
-    for(uint8_t i=0;i<3;i++) {
+    for(uint8_t i=0; i<3; i++) {
         lcdBacklightOff();
         _delay_ms(500);
         lcdBacklightOn();
         _delay_ms(500);
     }
-
-    // Inicializar ADC
-    ADCSRA = (1<<ADEN) | (1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0);
 }
 
-// ==================== Loop ====================
 void loop() {
-    static unsigned long lastSec = 0;
+    // Mostrar segundos desde encendido
+    lcdSetCursor(9, 1);
+    char buffer[6];
+    sprintf(buffer, "%4lu", millis()/1000);
+    lcdPrint(buffer);
 
     // Leer botón y mostrarlo
-    lcdSetCursor(0,1);
+    lcdSetCursor(0, 1);
     switch(getButtons()) {
         case ButtonRight: lcdPrint("RIGHT "); break;
         case ButtonLeft:  lcdPrint("LEFT  "); break;
@@ -180,19 +158,4 @@ void loop() {
         case ButtonSelect:lcdPrint("SELECT"); break;
         case ButtonNone:  lcdPrint("NONE  "); break;
     }
-
-    // Actualizar segundos sin bloquear
-    if(millis() - lastSec >= 1000) {
-        lastSec += 1000;
-        lcdSetCursor(9,1);
-        char buffer[6];
-        sprintf(buffer, "%4lu", lastSec/1000);
-        lcdPrint(buffer);
-    }
-}
-
-// ==================== Main ====================
-int main(void) {
-    setup();
-    while(1) loop();
 }
